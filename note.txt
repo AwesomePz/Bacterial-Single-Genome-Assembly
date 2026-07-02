@@ -1,0 +1,88 @@
+# 官方网页1：https://rrwick.github.io/2020/10/30/guide-to-bacterial-genome-assembly.html
+# 官方网页2：https://github.com/rrwick/Trycycler/wiki/How-to-run-Trycycler
+cd /share/appspace_data/shared_groups/BGI/USERS/lidenghui/Project/04.zhangweijia/genome/00.rawdata/trycycler/AT58-1
+mamba activate trycycler
+mkdir 00.fastq
+cat ../../Cyclone/250F602297011_AT58-1/250F602297011_barcode*/250F602297011_barcode*_01.fastq.gz > 00.fastq/250F602297011_barcode.fastq.gz
+cp ../../MGI_T7/E250083198_AT58-1/E250083198_L01_UDB-644_*.fq.gz 00.fastq/
+
+# 1.质控
+mkdir 01.qc && cd 01.qc/
+filtlong --min_length 1000 --keep_percent 95 ../00.fastq/250F602297011_barcode.fastq.gz > reads_3.fastq
+fastp --in1 ../00.fastq/E250083198_L01_UDB-644_1.fq.gz --in2 ../00.fastq/E250083198_L01_UDB-644_2.fq.gz --out1 reads_2_1.fq.gz --out2 reads_2_2.fq.gz --unpaired1 reads_2_u.fq.gz --unpaired2 reads_2_u.fq.gz
+gunzip reads_2_*.fq.gz
+# 计算深度depth=(bases in reads)/(bases in genome)
+vim depth.sh
+chmod 775 depth.sh
+sh depth.sh 5000000 reads_3.fastq reads_2_1.fq reads_2_2.fq
+# 发现数据过深，通过"seqtk sample -s 567 reads_3.fastq 0.2 > reads_3_subset.fastq"，"seqtk sample -s 123 reads_2_1.fq 0.04 > reads_2_1_subset.fq"和"seqtk sample -s 123 reads_2_2.fq 0.04 > reads_2_2_subset.fq"选取其中部分,后通过"sh depth.sh 5000000 reads_3_subset.fastq reads_2_1_subset.fq reads_2_2_subset.fq"再次计算深度
+
+# 2.子采样
+cd ..
+trycycler subsample --reads 01.qc/reads_3_subset.fastq --out_dir 02.subsets
+
+# 3.Generating assemblies
+mkdir 03.assemblies && cd 03.assemblies
+for i in 01 04 07 10; do
+	flye --nano-hq ../02.subsets/sample_"$i".fastq --threads 100 --out-dir assembly_"$i"
+	cp assembly_"$i"/assembly.fasta assembly_"$i".fasta
+	cp assembly_"$i"/assembly_graph.gfa assembly_"$i".gfa
+	rm -r assembly_"$i"
+done
+for i in 02 05 08 11; do
+	miniasm_and_minipolish.sh ../02.subsets/sample_"$i".fastq 100 > assembly_"$i".gfa
+	any2fasta assembly_"$i".gfa > assembly_"$i".fasta
+done
+for i in 03 06 09 12; do
+	raven --threads 100 --disable-checkpoints --graphical-fragment-assembly assembly_"$i".gfa ../02.subsets/sample_"$i".fastq > assembly_"$i".fasta
+done
+
+# 4.1 Generating assemblies(completed)
+# 4.2 Clustering contigs
+cd ..
+trycycler cluster --assemblies 03.assemblies/assembly_*.fasta --reads 01.qc/reads_3_subset.fastq --out_dir 04.cluster
+# 4.3 Reconciling contigs
+trycycler reconcile --reads 01.qc/reads_3_subset.fastq --cluster_dir 04.cluster/cluster_001/
+mv 04.cluster/cluster_001/1_contigs/C_Utg1570.fasta 04.cluster/cluster_001/1_contigs/C_Utg1570.fasta.bad #Worse sequence
+mv 04.cluster/cluster_001/1_contigs/F_Utg1556.fasta 04.cluster/cluster_001/1_contigs/F_Utg1556.fasta.bad #Worse sequence
+mv 04.cluster/cluster_001/1_contigs/L_Utg1392.fasta 04.cluster/cluster_001/1_contigs/L_Utg1392.fasta.bad #Worse sequence
+trycycler reconcile --reads 01.qc/reads_3_subset.fastq --cluster_dir 04.cluster/cluster_001/
+trycycler dotplot --cluster_dir 04.cluster/cluster_001/
+mv 04.cluster/cluster_001/1_contigs/E_utg000001c.fasta 04.cluster/cluster_001/1_contigs/E_utg000001c.fasta.bad #Same sequence
+trycycler reconcile --reads 01.qc/reads_3_subset.fastq --cluster_dir 04.cluster/cluster_001/
+trycycler dotplot --cluster_dir 04.cluster/cluster_001/
+# 4.4 Multiple sequence alignment
+trycycler msa --cluster_dir 04.cluster/cluster_001/
+# 4.5 Partitioning reads
+trycycler partition --reads 01.qc/reads_3_subset.fastq --cluster_dirs 04.cluster/cluster_001/
+# 4.6 Generating a consensus
+trycycler consensus --cluster_dir 04.cluster/cluster_001/
+
+# 5.Polypolish
+mkdir 05.polypolish && cd 05.polypolish
+bwa index ../04.cluster/cluster_001/7_final_consensus.fasta
+bwa mem -t 16 -a ../04.cluster/cluster_001/7_final_consensus.fasta ../01.qc/reads_2_1_subset.fq > alignments_1.sam
+bwa mem -t 16 -a ../04.cluster/cluster_001/7_final_consensus.fasta ../01.qc/reads_2_2_subset.fq > alignments_2.sam
+polypolish filter --in1 alignments_1.sam --in2 alignments_2.sam --out1 filtered_1.sam --out2 filtered_2.sam
+polypolish polish ../04.cluster/cluster_001/7_final_consensus.fasta filtered_1.sam filtered_2.sam > polished.fasta
+cd ..
+
+# 6.Pypolca
+pypolca run --careful -a 05.polypolish/polished.fasta -1 01.qc/reads_2_1_subset.fq -2 01.qc/reads_2_2_subset.fq -t 16 -o 06.pypolca
+mv 06.pypolca/pypolca_corrected.fasta 06.pypolca/polypolish_pypolca.fasta
+
+# 7.Barrnap
+mkdir 07.barrnap
+barrnap --threads 4 --outseq 07.barrnap/Bp_scan_rRNA.fa 06.pypolca/polypolish_pypolca.fasta > 07.barrnap/Bp_scan_rRNA.gff
+
+# 8.Check circular
+perl /share/appspace_data/shared_groups/BGI/USERS/lidenghui/software/mamba/envs/trycycler/bin/CheckCircularity.Modify.YL.V1.pl -max_read_len 50000 -blastn /share/appspace_data/shared_groups/BGI/USERS/lidenghui/software/mamba/envs/trycycler/bin/blastn 06.pypolca/polypolish_pypolca.fasta ./08.check_circluar
+perl /share/appspace_data/shared_groups/BGI/USERS/lidenghui/software/mamba/envs/trycycler/bin/Circular_stat.pl Pp 08.check_circluar/Cir.stat.xls 08.check_circluar/ 08.check_circluar/
+
+# 9.Checkm2
+mamba deactivate && mamba activate drep
+checkm2 predict --threads 30 --input 06.pypolca/polypolish_pypolca.fasta --output-directory 09.checkm2
+
+# 10.gtdbtk
+mamba deactivate && mamba activate gtdbtk
+gtdbtk classify_wf -x fasta --genome_dir 06.pypolca/ --out_dir 10.gtdbtk --cpus 30 --skip_ani_screen
